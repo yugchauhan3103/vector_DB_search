@@ -2131,3 +2131,565 @@ This gives both:
 •	quick overview 
 •	detailed audit trail
 
+
+
+
+
+
+
+
+RESPONSE:
+{
+  "status": "success",
+  "filename": "Production Tracking.docx",
+  "requirements": {
+    "modules": [
+      {
+        "name": "ProductionTracking",
+        "description": "This module allows users to define and track the production processes and job progress in the fenestration industry.",
+        "screens": [
+          {
+            "name": "ProductionProcessMasterScreen",
+            "purpose": "Define and configure the sequence of processes required to complete fabrication and execution of a job.",
+            "route": "/production-process-master",
+            "layout": "full-page",
+            "entry_points": [
+              "User clicks on Production Process Master from the main menu"
+            ],
+            "exit_points": [
+              "Returns to main dashboard on Save"
+            ],
+            "components": [
+              {
+                "id": "process_master_grid",
+                "type": "grid",
+                "title": "Process Master Grid",
+                "description": "Displays the list of production processes with options to add, edit, or delete.",
+                "data_source": "Production Process API",
+                "columns": [
+                  {
+                    "name": "processCode",
+                    "label": "Process Code",
+                    "type": "text",
+                    "sortable": true,
+                    "filterable": true,
+                    "alignment": "left"
+                  },
+                  {
+                    "name": "processName",
+                    "label": "Process Name",
+                    "type": "text",
+                    "sortable": true,
+                    "filterable": true,
+                    "alignment": "left"
+                  },
+                  {
+                    "name": "sequenceNumber",
+                    "label": "Sequence Number",
+                    "type": "number",
+                    "sortable": true,
+                    "filterable": true,
+                    "alignment": "right"
+                  },
+                  {
+                    "name": "finalProcess",
+                    "label": "Final Process",
+                    "type": "boolean",
+                    "sortable": false,
+                    "filterable": false,
+                    "alignment": "center"
+                  },
+                  {
+                    "name": "active",
+                    "label": "Active",
+                    "type": "boolean",
+                    "sortable": false,
+                    "filterable": false,
+                    "alignment": "center"
+                  }
+                ],
+                "actions": [
+                  {
+                    "label": "Add New",
+                    "type": "primary",
+                    "icon": "plus",
+                    "behavior": "opens Add New Process popup"
+                  },
+                  {
+                    "label": "Edit",
+                    "type": "secondary",
+                    "icon": "edit",
+                    "behavior": "opens Edit Process popup",
+                    "visible_when": "User selects a process"
+                  },
+                  {
+                    "label": "Delete",
+                    "type": "danger",
+                    "icon": "trash",
+                    "behavior": "prompts confirmation before deleting selected process",
+                    "visible_when": "User selects a process"
+                  },
+                  {
+                    "label": "Export to Excel",
+                    "type": "link",
+                    "behavior": "exports the process list to an Excel file"
+                  },
+                  {
+                    "label": "Print",
+                    "type": "link",
+                    "behavior": "prints the process list"
+                  }
+                ]
+              },
+              {
+                "id": "add_edit_process_form",
+                "type": "form",
+                "title": "Add/Edit Process Form",
+                "description": "Form to add or edit a production process.",
+                "data_source": "local state",
+                "fields": [
+                  {
+                    "name": "processCode",
+                    "label": "Process Code",
+                    "type": "text",
+                    "required": true,
+                    "default_value": null,
+                    "validation": [
+                      "Must be unique"
+                    ]
+                  },
+                  {
+                    "name": "processName",
+                    "label": "Process Name",
+                    "type": "text",
+                    "required": true,
+                    "default_value": null
+                  },
+                  {
+                    "name": "sequenceNumber",
+                    "label": "Sequence Number",
+                    "type": "number",
+                    "required": true,
+                    "default_value": null,
+                    "validation": [
+                      "Must be unique"
+                    ]
+                  },
+                  {
+                    "name": "finalProcess",
+                    "label": "Final Process",
+                    "type": "checkbox",
+                    "required": false,
+                    "default_value": false,
+                    "behavior": "Only one process should be final"
+                  },
+                  {
+                    "name": "setupScanning",
+                    "label": "Setup Scanning",
+                    "type": "checkbox",
+                    "required": false,
+                    "default_value": false,
+                    "behavior": "Required for real-time tracking"
+                  },
+                  {
+                    "name": "isProcessOnQuantity",
+                    "label": "Is Process On Quantity",
+                    "type": "checkbox",
+                    "required": false,
+                    "default_value": false,
+                    "behavior": "If checked, qty input required"
+                  },
+                  {
+                    "name": "default",
+                    "label": "Default",
+                    "type": "checkbox",
+                    "required": false,
+                    "default_value": false,
+                    "behavior": "Comes pre-configured, can be modified by user"
+                  },
+                  {
+                    "name": "active",
+                    "label": "Active",
+                    "type": "checkbox",
+                    "required": false,
+                    "default_value": true
+                  }
+                ],
+                "actions": [
+                  {
+                    "label": "Save",
+                    "type": "primary",
+                    "behavior": "saves the process and closes the form"
+                  },
+                  {
+                    "label": "Cancel",
+                    "type": "secondary",
+                    "behavior": "closes the form without saving"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "name": "JobProductionTrackingScreen",
+            "purpose": "Monitor and control job-wise production progress from fabrication to dispatch and site installation.",
+            "route": "/job-production-tracking",
+            "layout": "full-page",
+            "entry_points": [
+              "User clicks on Job Production Tracking from the main menu"
+            ],
+            "exit_points": [
+              "Returns to main dashboard on Save"
+            ],
+            "components": [
+              {
+                "id": "job_production_grid",
+                "type": "grid",
+                "title": "Job Production Tracking Grid",
+                "description": "Displays the list of jobs with their production status.",
+                "data_source": "Job Production API",
+                "columns": [
+                  {
+                    "name": "jobNumber",
+                    "label": "Job Number",
+                    "type": "text",
+                    "sortable": true,
+                    "filterable": true,
+                    "alignment": "left"
+                  },
+                  {
+                    "name": "status",
+                    "label": "Status",
+                    "type": "text",
+                    "sortable": true,
+                    "filterable": true,
+                    "alignment": "left"
+                  },
+                  {
+                    "name": "productionDate",
+                    "label": "Production Date",
+                    "type": "date",
+                    "sortable": true,
+                    "filterable": true,
+                    "alignment": "center"
+                  },
+                  {
+                    "name": "deliveryDate",
+                    "label": "Delivery Date",
+                    "type": "date",
+                    "sortable": true,
+                    "filterable": true,
+                    "alignment": "center"
+                  },
+                  {
+                    "name": "progress",
+                    "label": "Progress",
+                    "type": "progress",
+                    "sortable": false,
+                    "filterable": false,
+                    "alignment": "center"
+                  }
+                ],
+                "actions": [
+                  {
+                    "label": "Edit",
+                    "type": "secondary",
+                    "icon": "edit",
+                    "behavior": "opens Job Detail popup",
+                    "visible_when": "User selects a job"
+                  },
+                  {
+                    "label": "Refresh",
+                    "type": "link",
+                    "behavior": "reloads the job production data"
+                  },
+                  {
+                    "label": "Export to Excel",
+                    "type": "link",
+                    "behavior": "exports the job tracking data to an Excel file"
+                  },
+                  {
+                    "label": "Print",
+                    "type": "link",
+                    "behavior": "prints the job tracking data"
+                  }
+                ]
+              },
+              {
+                "id": "job_detail_popup",
+                "type": "popup",
+                "title": "Job Detail",
+                "description": "Displays detailed information about the selected job.",
+                "data_source": "local state",
+                "fields": [
+                  {
+                    "name": "jobNumber",
+                    "label": "Job Number",
+                    "type": "text",
+                    "readonly": true
+                  },
+                  {
+                    "name": "customerName",
+                    "label": "Customer Name",
+                    "type": "text",
+                    "readonly": true
+                  },
+                  {
+                    "name": "status",
+                    "label": "Status",
+                    "type": "text",
+                    "readonly": true
+                  },
+                  {
+                    "name": "productionProgress",
+                    "label": "Production Progress",
+                    "type": "text",
+                    "readonly": true
+                  },
+                  {
+                    "name": "deliveryStatus",
+                    "label": "Delivery Status",
+                    "type": "text",
+                    "readonly": true
+                  }
+                ],
+                "actions": [
+                  {
+                    "label": "Close",
+                    "type": "secondary",
+                    "behavior": "closes the popup"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "name": "MaterialConsumptionScreen",
+            "purpose": "Record the actual quantity of material consumed by the Production Team after the material has already been issued against a specific Job.",
+            "route": "/material-consumption",
+            "layout": "full-page",
+            "entry_points": [
+              "User clicks on Material Consumption from the main menu"
+            ],
+            "exit_points": [
+              "Returns to main dashboard on Save"
+            ],
+            "components": [
+              {
+                "id": "material_consumption_summary_grid",
+                "type": "grid",
+                "title": "Material Consumption Summary Grid",
+                "description": "Displays the summary of material consumption for the selected job.",
+                "data_source": "Material Consumption API",
+                "columns": [
+                  {
+                    "name": "materialType",
+                    "label": "Material Type",
+                    "type": "text",
+                    "sortable": true,
+                    "filterable": true,
+                    "alignment": "left"
+                  },
+                  {
+                    "name": "issuedQuantity",
+                    "label": "Issued Quantity",
+                    "type": "number",
+                    "sortable": true,
+                    "filterable": false,
+                    "alignment": "right"
+                  },
+                  {
+                    "name": "consumedQuantity",
+                    "label": "Consumed Quantity",
+                    "type": "number",
+                    "sortable": true,
+                    "filterable": false,
+                    "alignment": "right"
+                  },
+                  {
+                    "name": "returnedQuantity",
+                    "label": "Returned Quantity",
+                    "type": "number",
+                    "sortable": true,
+                    "filterable": false,
+                    "alignment": "right"
+                  },
+                  {
+                    "name": "remainingQuantity",
+                    "label": "Remaining Quantity",
+                    "type": "number",
+                    "sortable": false,
+                    "filterable": false,
+                    "alignment": "right"
+                  }
+                ],
+                "actions": [
+                  {
+                    "label": "Add Consumption",
+                    "type": "primary",
+                    "icon": "plus",
+                    "behavior": "opens Add Consumption popup"
+                  },
+                  {
+                    "label": "View History",
+                    "type": "link",
+                    "behavior": "opens Consumption History popup"
+                  },
+                  {
+                    "label": "Refresh",
+                    "type": "link",
+                    "behavior": "reloads the material consumption data"
+                  },
+                  {
+                    "label": "Export to Excel",
+                    "type": "link",
+                    "behavior": "exports the material consumption data to an Excel file"
+                  },
+                  {
+                    "label": "Print",
+                    "type": "link",
+                    "behavior": "prints the material consumption report"
+                  }
+                ]
+              },
+              {
+                "id": "add_consumption_popup",
+                "type": "popup",
+                "title": "Add Consumption Entry",
+                "description": "Form to add a new material consumption entry.",
+                "data_source": "local state",
+                "fields": [
+                  {
+                    "name": "consumptionDate",
+                    "label": "Consumption Date",
+                    "type": "date",
+                    "required": true
+                  },
+                  {
+                    "name": "consumedQuantity",
+                    "label": "Consumed Quantity",
+                    "type": "number",
+                    "required": true,
+                    "validation": [
+                      "Must be numeric",
+                      "Must be greater than zero"
+                    ]
+                  },
+                  {
+                    "name": "remarks",
+                    "label": "Remarks",
+                    "type": "textarea",
+                    "required": false
+                  }
+                ],
+                "actions": [
+                  {
+                    "label": "Save",
+                    "type": "primary",
+                    "behavior": "saves the consumption entry and closes the popup"
+                  },
+                  {
+                    "label": "Cancel",
+                    "type": "secondary",
+                    "behavior": "closes the popup without saving"
+                  }
+                ]
+              },
+              {
+                "id": "consumption_history_popup",
+                "type": "popup",
+                "title": "Consumption History",
+                "description": "Displays the history of material consumption entries.",
+                "data_source": "Consumption History API",
+                "columns": [
+                  {
+                    "name": "consumptionDate",
+                    "label": "Date",
+                    "type": "date",
+                    "sortable": true,
+                    "filterable": true,
+                    "alignment": "center"
+                  },
+                  {
+                    "name": "consumedQuantity",
+                    "label": "Consumed Quantity",
+                    "type": "number",
+                    "sortable": true,
+                    "filterable": false,
+                    "alignment": "right"
+                  },
+                  {
+                    "name": "remarks",
+                    "label": "Remarks",
+                    "type": "text",
+                    "sortable": false,
+                    "filterable": false,
+                    "alignment": "left"
+                  }
+                ],
+                "actions": [
+                  {
+                    "label": "Close",
+                    "type": "secondary",
+                    "behavior": "closes the popup"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "shared": {
+      "enums": [
+        {
+          "name": "JobStatus",
+          "values": [
+            "All",
+            "Secured Job",
+            "In Production",
+            "Pending Dispatch",
+            "Dispatched",
+            "Installation In Progress",
+            "Completed"
+          ]
+        },
+        {
+          "name": "MaterialType",
+          "values": [
+            "Profile",
+            "Glass",
+            "Hardware",
+            "Accessories",
+            "Other"
+          ]
+        }
+      ],
+      "global_actions": [
+        "Logout",
+        "Help",
+        "Notifications"
+      ],
+      "global_business_rules": [
+        "Process flow defines job tracking",
+        "Final process defines job completion",
+        "Scanning-enabled processes support real-time updates"
+      ],
+      "external_integrations": [
+        "Barcode Generation API",
+        "Material Issue API",
+        "Material Return API"
+      ],
+      "notes": "Ensure all forms and grids are responsive and accessible."
+    }
+  },
+  "usage": {
+    "input_tokens": 9711,
+    "output_tokens": 3178,
+    "total_tokens": 12889,
+    "input_cost_usd": 0.001457,
+    "output_cost_usd": 0.001907,
+    "total_cost_usd": 0.003363,
+    "model": "gpt-4o-mini"
+  }
+}
