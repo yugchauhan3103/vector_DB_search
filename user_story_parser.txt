@@ -1,0 +1,2133 @@
+user_story_parser
+
+extractor.py
+"""
+Text Extraction Service
+Supports .docx (python-docx) and .pdf (pdfplumber / PyMuPDF fallback).
+
+"""
+
+import io
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+SUPPORTED_EXTENSIONS = {".docx", ".pdf"}
+SUPPORTED_MIME_TYPES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/pdf",
+    "application/octet-stream",  # browsers sometimes send generic MIME
+}
+
+
+def extract_text_from_file(file_bytes: bytes, filename: str, content_type: str) -> str:
+    """
+    Detect file type and extract plain text.
+
+    Args:
+        file_bytes: Raw bytes of the uploaded file.
+        filename:   Original filename (used to detect extension).
+        content_type: MIME type reported by the browser.
+
+    Returns:
+        Extracted plain text as a string.
+
+    Raises:
+        ValueError: If file type is not supported.
+    """
+    ext = Path(filename).suffix.lower()
+
+    if ext == ".docx" or "wordprocessingml" in (content_type or ""):
+        logger.info("Extracting text from DOCX: %s", filename)
+        return _extract_from_docx(file_bytes)
+
+    if ext == ".pdf" or content_type == "application/pdf":
+        logger.info("Extracting text from PDF: %s", filename)
+        return _extract_from_pdf(file_bytes)
+
+    raise ValueError(
+        f"Unsupported file type '{ext}'. Only .docx and .pdf are supported."
+    )
+
+
+# ---------------------------------------------------------------------------
+# DOCX extraction
+# ---------------------------------------------------------------------------
+
+def _extract_from_docx(file_bytes: bytes) -> str:
+    """Extract text from a .docx file using python-docx."""
+    try:
+        from docx import Document  # python-docx
+    except ImportError:
+        raise RuntimeError(
+            "python-docx is not installed. Run: pip install python-docx"
+        )
+
+    doc = Document(io.BytesIO(file_bytes))
+    parts: list[str] = []
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            parts.append(text)
+
+    # Also extract text from tables (important for user stories with tabular data)
+    for table in doc.tables:
+        for row in table.rows:
+            row_cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if row_cells:
+                parts.append(" | ".join(row_cells))
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# PDF extraction
+# ---------------------------------------------------------------------------
+
+def _extract_from_pdf(file_bytes: bytes) -> str:
+    """
+    Extract text from a PDF.
+    Tries pdfplumber first (better layout), falls back to PyMuPDF (fitz).
+    """
+    text = _extract_pdf_pdfplumber(file_bytes)
+    if text and text.strip():
+        return text
+
+    logger.warning("pdfplumber returned empty text; trying PyMuPDF fallback.")
+    text = _extract_pdf_pymupdf(file_bytes)
+    if text and text.strip():
+        return text
+
+    raise ValueError(
+        "Could not extract any text from the PDF. "
+        "The file may be scanned/image-based. Please use a text-selectable PDF."
+    )
+
+
+def _extract_pdf_pdfplumber(file_bytes: bytes) -> str:
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.warning("pdfplumber not installed; skipping. Run: pip install pdfplumber")
+        return ""
+
+    pages: list[str] = []
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                pages.append(page_text.strip())
+    return "\n\n".join(pages)
+
+
+def _extract_pdf_pymupdf(file_bytes: bytes) -> str:
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        logger.warning("PyMuPDF not installed; skipping. Run: pip install PyMuPDF")
+        return ""
+
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pages: list[str] = []
+    for page in doc:
+        pages.append(page.get_text())
+    doc.close()
+    return "\n\n".join(pages)
+
+
+
+
+llm_service.py
+"""
+LLM Service — Requirement Extractor
+Sends extracted user story text to the configured LLM and returns
+a structured JSON representation of all requirements.
+"""
+
+import json
+import logging
+import os
+import re
+from typing import Any
+
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Config — pick up from environment variables (set in .env or your config)
+# ---------------------------------------------------------------------------
+LLM_API_KEY = os.getenv("OPENAI_API_KEY")
+LLM_MODEL = "gpt-4o-mini"
+LLM_TIMEOUT = 120
+
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    "gpt-4o-mini": {"input": 0.000150, "output": 0.000600},   # per 1K tokens
+    "gpt-4o":      {"input": 0.002500, "output": 0.010000},
+    "gpt-4-turbo": {"input": 0.010000, "output": 0.030000},
+    "gpt-3.5-turbo": {"input": 0.000500, "output": 0.001500},
+}
+ 
+ 
+def _calculate_cost(model: str, input_tokens: int, output_tokens: int) -> dict[str, Any]:
+    """Calculate cost based on model pricing per 1K tokens."""
+    pricing = MODEL_PRICING.get(model, MODEL_PRICING.get("gpt-4o-mini"))
+    input_cost  = (input_tokens  / 1000) * pricing["input"]
+    output_cost = (output_tokens / 1000) * pricing["output"]
+    total_cost  = input_cost + output_cost
+ 
+    return {
+        "input_tokens":  input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens":  input_tokens + output_tokens,
+        "input_cost_usd":  round(input_cost,  6),
+        "output_cost_usd": round(output_cost, 6),
+        "total_cost_usd":  round(total_cost,  6),
+        "model": model,
+    }
+
+# ---------------------------------------------------------------------------
+# Master prompt — structured, step-by-step, comprehensive
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """
+You are a senior frontend architect and product analyst with deep expertise in React-based
+web application development. Your task is to read any requirement document — regardless of
+domain, industry, or complexity — and extract a complete, exhaustive frontend UI specification
+that can be directly used to generate production-ready React components and screens.
+ 
+═══════════════════════════════════════════════════════════
+SCOPE — WHAT YOU MUST CAPTURE
+═══════════════════════════════════════════════════════════
+ 
+Focus ONLY on what a user can see, click, interact with, fill in, or print.
+Ignore all backend, database, server-side, or accounting logic UNLESS it directly
+affects how the UI behaves or what the UI shows.
+ 
+You must capture EVERYTHING in the following categories:
+ 
+  UI STRUCTURE
+  ├── All screens, pages, views, tabs, and modals
+  ├── Layout and composition of each screen
+  ├── Navigation flow between screens
+  └── Entry points and exit points of each screen
+ 
+  DATA DISPLAY
+  ├── Tables, grids, and data listings
+  ├── KPI cards, summary widgets, metric tiles
+  ├── Charts, graphs, progress bars, sparklines
+  ├── Status indicators, color-coded badges, legends
+  ├── Timelines, audit logs, history panels
+  └── Tree views, hierarchical lists, nested structures
+ 
+  DATA ENTRY
+  ├── All form fields with types, labels, defaults
+  ├── Dropdowns, multi-selects, autocomplete
+  ├── Date pickers, time pickers, date-range pickers
+  ├── File and image upload areas
+  ├── Rich text editors, code editors
+  ├── Checkboxes, radio groups, toggles, sliders
+  └── Inline editable cells in grids
+ 
+  ACTIONS & CONTROLS
+  ├── Toolbar buttons (Add, Edit, Delete, Save, etc.)
+  ├── Row-level actions (Edit, Delete, View, Clone, etc.)
+  ├── Bulk / multi-select actions
+  ├── Floating action buttons, icon buttons
+  ├── Export (Excel, PDF, CSV), Print, Import actions
+  ├── Scan actions (barcode, QR code)
+  └── Pagination, load-more, infinite scroll controls
+ 
+  FILTERS & SEARCH
+  ├── Search bars (simple and advanced)
+  ├── Filter panels with all filter fields
+  ├── Quick filter chips or toggle filters
+  ├── Date range filters, status filters
+  └── Filter reset and apply actions
+ 
+  POPUPS & OVERLAYS
+  ├── Modals, dialogs, drawers, side panels
+  ├── Confirmation dialogs
+  ├── Detail view popups
+  ├── Notification toasts and alerts
+  └── Tooltips if described
+ 
+  VALIDATION & BEHAVIOR
+  ├── All field-level validation rules
+  ├── Form-level validation (cross-field rules)
+  ├── Conditional visibility (show/hide fields)
+  ├── Conditional enable/disable of fields or buttons
+  ├── Auto-fill, auto-calculate, auto-populate behavior
+  ├── Real-time feedback (scan success/error, inline errors)
+  └── Confirmation prompts before destructive actions
+ 
+  PRINT & EXPORT LAYOUTS
+  ├── Print view structure and fields
+  ├── Export file format and included columns
+  └── Label or report layout if described
+ 
+═══════════════════════════════════════════════════════════
+OUTPUT FORMAT
+═══════════════════════════════════════════════════════════
+ 
+Return ONLY a single valid JSON object. No markdown. No explanation. No code fences.
+ 
+TOP-LEVEL STRUCTURE:
+{
+  "modules": [
+    {
+      "name": "<module name>",
+      "description": "<one sentence: what this module does and who uses it>",
+      "screens": [ <Screen objects — see schema below> ]
+    }
+  ],
+  "shared": {
+    "enums": [
+      {
+        "name": "<EnumName>",
+        "values": ["<value1>", "<value2>"]
+      }
+    ],
+    "global_actions": [
+      "<action available throughout the module, e.g. Logout, Help, Notifications>"
+    ],
+    "global_business_rules": [
+      "<rule that applies across the entire module>"
+    ],
+    "external_integrations": [
+      "<name of external system, module, or API this module depends on>"
+    ],
+    "notes": "<any overarching UX notes, themes, or design guidelines mentioned>"
+  }
+}
+ 
+═══════════════════════════════════════════════════════════
+SCREEN SCHEMA
+═══════════════════════════════════════════════════════════
+ 
+{
+  "name": "<PascalCase screen name — descriptive, e.g. OrderListingScreen, PatientAdmissionForm>",
+  "purpose": "<one sentence: what the user accomplishes on this screen>",
+  "route": "<suggested URL, e.g. /orders, /patients/admit, /reports/sales>",
+  "layout": "<one of: full-page | split | tab-based | wizard | dashboard | modal | drawer | sidebar>",
+  "entry_points": ["<how user reaches this screen, e.g. clicks Add button on OrderListingScreen>"],
+  "exit_points":  ["<where user goes after, e.g. returns to OrderListingScreen on Save>"],
+  "components": [ <Component objects — see schema below> ]
+}
+ 
+═══════════════════════════════════════════════════════════
+COMPONENT SCHEMA
+═══════════════════════════════════════════════════════════
+ 
+Every visible UI element on a screen is a component.
+Each component MUST have a "type" from the allowed list.
+A screen can have multiple components of the same type (e.g. two grids, three forms).
+ 
+ALLOWED COMPONENT TYPES:
+  toolbar         — top action bar with buttons
+  filter_panel    — search and filter section
+  grid            — data table / listing
+  form            — data entry or edit form
+  tabs            — tabbed container (children = components inside each tab)
+  popup           — modal, dialog, drawer, or side panel
+  chart           — any visual chart or graph
+  kpi             — metric card, summary tile, stat widget
+  wizard          — multi-step form or flow
+  timeline        — chronological event list or audit trail
+  tree            — hierarchical / nested list
+  print_view      — print or export layout
+  legend          — color or status legend
+  info_panel      — read-only detail view or summary section
+  upload_zone     — file or image upload area
+  scan_panel      — barcode or QR scanning interface
+  custom          — any UI element not fitting above types
+ 
+COMPONENT OBJECT:
+{
+  "id": "<unique snake_case id, e.g. order_grid, add_order_form, date_filter_panel>",
+  "type": "<one of the allowed types above>",
+  "title": "<display title shown on screen, if any>",
+  "description": "<what this component does or shows>",
+  "data_source": "<where data comes from, e.g. Orders API, local state, parent screen selection>",
+ 
+  "fields": [
+    {
+      "name": "<camelCase field name>",
+      "label": "<display label>",
+      "type": "<see FIELD TYPES below>",
+      "required": true,
+      "default_value": null,
+      "placeholder": "<hint text if mentioned>",
+      "options": ["<for dropdowns, radios, checkboxes>"],
+      "validation": ["<each rule as a string, e.g. Must be unique, Max 255 characters>"],
+      "readonly": false,
+      "hidden": false,
+      "behavior": "<conditional logic, e.g. Visible only when status is Active, Auto-filled from Job Number>"
+    }
+  ],
+ 
+  "columns": [
+    {
+      "name": "<camelCase column name>",
+      "label": "<display header>",
+      "type": "<see COLUMN TYPES below>",
+      "sortable": true,
+      "filterable": false,
+      "width": "<fixed width if mentioned, e.g. 120px>",
+      "alignment": "<left | center | right>",
+      "format": "<formatting rule, e.g. DD-MM-YYYY, 2 decimal places, currency>",
+      "color_logic": "<e.g. Green if Completed, Red if Overdue, Yellow if Pending>",
+      "clickable": false,
+      "notes": "<any special rendering, e.g. shows progress bar, clickable to open detail>"
+    }
+  ],
+ 
+  "actions": [
+    {
+      "label": "<button label>",
+      "type": "<primary | secondary | danger | icon | link | fab>",
+      "icon": "<icon name if mentioned, e.g. plus, edit, trash, download>",
+      "behavior": "<what happens: opens popup, calls API, navigates, downloads, confirms, etc.>",
+      "visible_when": "<condition under which this action is visible, if any>",
+      "disabled_when": "<condition under which this action is disabled, if any>"
+    }
+  ],
+ 
+  "filters": [
+    {
+      "name": "<camelCase filter name>",
+      "label": "<display label>",
+      "type": "<text | number | dropdown | multi-select | date | date-range | checkbox | radio | toggle>",
+      "options": ["<options for dropdown/radio/checkbox>"],
+      "default_value": null,
+      "required": false,
+      "triggers_search": true
+    }
+  ],
+ 
+  "behaviors": [
+    {
+      "trigger": "<what causes this behavior, e.g. User selects Job Number, Page loads, Scan succeeds>",
+      "action": "<what happens, e.g. Loads related material list, Auto-fills delivery date, Shows error toast>",
+      "condition": "<optional condition, e.g. Only if status is Draft>"
+    }
+  ],
+ 
+  "validations": [
+    "<each validation rule as a plain English sentence>"
+  ],
+ 
+  "layout_hint": "<optional: how this component is arranged, e.g. 2-column grid, full-width, right-aligned footer>",
+ 
+  "children": [
+    "<for tabs and wizards: nested component objects or tab/step names with their components>"
+  ],
+ 
+  "notes": "<edge cases, UX notes, or anything that doesn't fit above>"
+}
+ 
+═══════════════════════════════════════════════════════════
+FIELD TYPES (use for form fields)
+═══════════════════════════════════════════════════════════
+text | number | decimal | email | password | phone | url
+textarea | rich_text | code_editor
+dropdown | multi_select | autocomplete | combobox
+checkbox | checkbox_group | radio | toggle | switch | slider | rating
+date | time | datetime | date_range | time_range
+file_upload | image_upload | avatar_upload
+color_picker | signature | otp
+readonly | hidden | label | divider | spacer
+ 
+═══════════════════════════════════════════════════════════
+COLUMN TYPES (use for grid columns)
+═══════════════════════════════════════════════════════════
+text | number | decimal | currency | percentage
+boolean | badge | tag | multi_tag
+date | time | datetime
+image | avatar | icon
+link | button | action_buttons
+progress | progress_bar | sparkline
+indicator | color_dot | status_chip
+checkbox | expand_row | drag_handle
+ 
+═══════════════════════════════════════════════════════════
+EXTRACTION RULES — READ CAREFULLY
+═══════════════════════════════════════════════════════════
+ 
+RULE 1 — BE EXHAUSTIVE
+Every field, column, button, filter, behavior, and rule mentioned in the document
+must appear in the output. Missing items = incomplete output.
+ 
+RULE 2 — ONE COMPONENT PER DISTINCT UI ELEMENT
+If a screen has a filter section + a grid + an action toolbar → three components.
+If there are two separate grids on one screen → two grid components.
+If a popup has a form inside it → the popup component contains the form in children.
+ 
+RULE 3 — ADAPTIVE — ONLY WHAT IS MENTIONED
+Do not add components, fields, or rules not described in the document.
+A simple form screen may have only a toolbar and a form component.
+A dashboard may have only kpi and chart components.
+ 
+RULE 4 — MULTI-MODULE DOCUMENTS
+If the document describes multiple modules or major sections, create one module object
+per section in the top-level "modules" array.
+ 
+RULE 5 — SHARED ENUMS
+Any status list, category list, or constant set used across multiple screens
+must go into shared.enums, NOT repeated in every screen.
+ 
+RULE 6 — NAVIGATION
+Always describe how a user enters and exits each screen when the document mentions it.
+ 
+RULE 7 — BEHAVIORS ARE CRITICAL
+Dynamic behaviors (conditional fields, auto-fill, real-time feedback, scan responses,
+confirmation dialogs) are often the most important part of a UI spec.
+Capture every single one.
+ 
+RULE 8 — PRINT AND EXPORT
+If the document mentions print layouts, export formats, label designs, or report
+structures, extract them as print_view components with their fields and layout.
+ 
+RULE 9 — STRICT JSON OUTPUT
+Return ONLY the JSON object. No text before or after. No markdown fences.
+The output must be directly parseable by JSON.parse() without any cleanup.
+""".strip()
+ 
+ 
+USER_PROMPT_TEMPLATE = """
+Below is the full text extracted from a user story or functional specification document.
+You must analyze the entire document from start to end and extract a complete frontend UI specification exactly as defined in the system instructions.
+Do not summarize, compress, or omit repetitive sections. If the same screen pattern appears multiple times, extract each instance separately if it represents a distinct UI context.
+If any information appears in tables, bullet lists, captions, or footnotes, it must also be included in the output.
+--- DOCUMENT START ---
+{user_story_text}
+--- DOCUMENT END ---
+""".strip()
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+async def extract_requirements_from_text(user_story_text: str) -> dict[str, Any]:
+    """
+    Send user story text to the LLM and return parsed requirements as a dict.
+
+    Raises:
+        RuntimeError: if the LLM call fails or returns non-JSON.
+    """
+    prompt = USER_PROMPT_TEMPLATE.format(user_story_text=user_story_text)
+
+    raw, usage = await _call_openai(prompt)
+
+    requirements = _parse_json_response(raw)
+ 
+    return {
+        "requirements": requirements,
+        "usage": usage,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Provider adapters
+# ---------------------------------------------------------------------------
+
+async def _call_openai(prompt: str) -> str:
+    """Call OpenAI Chat Completions API."""
+    url = url = "https://api.openai.com/v1/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 8192,
+        "response_format": {"type": "json_object"},
+    }
+
+    async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+
+    content = data["choices"][0]["message"]["content"]
+ 
+    # OpenAI always returns usage in the response
+    raw_usage = data.get("usage", {})
+    input_tok = raw_usage.get("prompt_tokens", 0)
+    output_tok = raw_usage.get("completion_tokens", 0)
+    usage = _calculate_cost(LLM_MODEL, input_tok, output_tok)
+ 
+    return content, usage
+
+
+# ---------------------------------------------------------------------------
+# JSON parsing
+# ---------------------------------------------------------------------------
+
+def _parse_json_response(raw: str) -> dict[str, Any]:
+    """
+    Parse LLM response to a Python dict.
+    Strips markdown code fences if present.
+    """
+    if not raw or not raw.strip():
+        raise RuntimeError("LLM returned an empty response.")
+
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned.strip())
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        logger.error("LLM response was not valid JSON:\n%s", raw[:500])
+        raise RuntimeError(
+            f"LLM did not return valid JSON. Parse error: {e}. "
+            f"Raw response (first 300 chars): {raw[:300]}"
+        )
+
+
+
+
+user_story.py
+"""
+User Story Parser Router
+Handles file upload (docx/pdf), text extraction, and LLM-based requirement extraction.
+"""
+
+import logging
+from fastapi import APIRouter, File, UploadFile, HTTPException, status
+from fastapi.responses import JSONResponse
+
+from user_story_parser.extractor import extract_text_from_file
+from user_story_parser.llm_service import extract_requirements_from_text
+from user_story_parser.validators import validate_uploaded_file
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/user-story", tags=["User Story Parser"])
+
+
+@router.post(
+    "/parse",
+    summary="Parse a user story document and extract structured requirements",
+    description=(
+        "Upload a user story document (.docx or .pdf). "
+        "The API extracts the text, passes it through an LLM with a structured prompt, "
+        "and returns a detailed JSON describing screens, components, fields, validations, "
+        "business rules, and more."
+    ),
+    response_description="Structured JSON representation of the user story requirements",
+)
+
+async def parse_user_story(
+    file: UploadFile = File(..., description="User story document (.docx or .pdf)"),
+):
+    # Step 1: Validate
+    validate_uploaded_file(file)
+ 
+    # Step 2: Read file bytes
+    try:
+        file_bytes = await file.read()
+    except Exception as e:
+        logger.error("Failed to read uploaded file: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Could not read uploaded file: {str(e)}",
+        )
+ 
+    # Step 3: Extract text
+    try:
+        extracted_text = extract_text_from_file(
+            file_bytes=file_bytes,
+            filename=file.filename,
+            content_type=file.content_type,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    except Exception as e:
+        logger.error("Text extraction failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Text extraction failed: {str(e)}",
+        )
+ 
+    if not extracted_text or not extracted_text.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No text could be extracted from the uploaded document.",
+        )
+ 
+    # Step 4: LLM extraction
+    try:
+        result = await extract_requirements_from_text(extracted_text)
+    except Exception as e:
+        logger.error("LLM extraction failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Requirement extraction via LLM failed: {str(e)}",
+        )
+ 
+    # Step 5: Return requirements + usage + cost
+    return JSONResponse(
+        content={
+            "status": "success",
+            "filename": file.filename,
+            "requirements": result["requirements"],
+            "usage": result["usage"],
+        }
+    )
+
+
+# @router.get("/health", summary="Health check for user story parser")
+# async def health_check():
+#     return {"status": "ok", "module": "user_story_parser"}
+
+
+
+
+validator.py
+"""
+File validation utilities for uploaded user story documents.
+"""
+
+from fastapi import HTTPException, UploadFile, status
+
+# 20 MB limit
+MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024
+
+ALLOWED_EXTENSIONS = {".docx", ".pdf"}
+
+ALLOWED_CONTENT_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/octet-stream",  # some browsers send this for .docx
+}
+
+
+def validate_uploaded_file(file: UploadFile) -> None:
+    """
+    Validate the uploaded file for type and basic sanity.
+
+    Raises:
+        HTTPException 400 if validation fails.
+    """
+    if not file.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No filename provided.",
+        )
+
+    from pathlib import Path
+    ext = Path(file.filename).suffix.lower()
+
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unsupported file type '{ext}'. "
+                f"Allowed types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+            ),
+        )
+
+    # Content-type check (lenient — browsers can send generic types)
+    content_type = (file.content_type or "").lower()
+    if content_type and content_type not in ALLOWED_CONTENT_TYPES:
+        # Warn but don't hard-block — some valid .docx come as octet-stream
+        import logging
+        logging.getLogger(__name__).warning(
+            "Unexpected content_type '%s' for file '%s'. Proceeding by extension.",
+            content_type, file.filename,
+        )
+
+
+
+
+
+
+
+Module Name: Production Tracking
+________________________________________
+1. Production Process Master
+________________________________________
+1.1 Purpose
+The Production Process Master is used to define and configure the sequence of processes required to complete fabrication and execution of a job in the fenestration industry.
+It allows:
+•	defining production workflow 
+•	customizing process steps per organization 
+•	enabling scanning-based tracking 
+•	controlling job-wise production flow 
+________________________________________
+1.2 Core Concept
+Each job will follow a sequence of processes defined in this master.
+👉 Example:
+Cutting → Crimping → Assembly → Dispatch → Installation
+________________________________________
+1.3 Flexibility (Important)
+•	Default processes will be provided by system 
+•	Fabricator can edit / remove / reorder / add new processes 
+•	Process flow is configurable per organization 
+________________________________________
+1.4 Top Grid / Actions
+Action	Description
+Add New	Create new process
+Edit	Modify process
+Refresh	Reload data
+Export to Excel	Export process list
+Print	Print process list
+Barcode	Generate Process Barcode
+________________________________________
+1.5 Process Master Grid
+Field	Description
+Process Code	Unique code
+Process Name	Name
+Process Description	Description
+Sequence Number	Execution order
+Process Weightage	% contribution
+Final Process	Indicates last stage
+Setup Scanning	Enable barcode scanning
+Is Process On Quantity	Qty-based tracking
+Default	System default
+Active	Active/Inactive
+________________________________________
+1.6 Add New / Edit Process Screen
+(Based on your UI screenshot 👍)
+________________________________________
+1.6.1 Fields Definition
+🔹 Basic Fields
+Field	Description
+Image	Upload process image
+Process Code	Unique identifier (e.g. CUT, CRP)
+Process Name	Process name (e.g. Cutting)
+Process Description	Description
+________________________________________
+🔹 Control Fields
+Field	Description
+Sequence Number	Defines order of execution
+Process Weightage	% contribution to production
+________________________________________
+🔹 Checkboxes (Very Important Logic)
+________________________________________
+✅ Final Process
+👉 Marks last process of production
+Behavior:
+•	Only one process should be final 
+•	Job considered complete after this 
+________________________________________
+✅ Setup Scanning
+👉 Enables barcode scanning for this process
+Behavior:
+•	Required for real-time tracking 
+•	If unchecked → manual update only 
+________________________________________
+✅ Is Process On Quantity
+👉 Process will track quantity
+Behavior:
+•	If checked → qty input required 
+•	If unchecked → status-based only 
+________________________________________
+✅ Default
+👉 System default process
+Behavior:
+•	Comes pre-configured 
+•	Can be modified by user 
+________________________________________
+✅ Active
+👉 Process is active
+Behavior:
+•	Only active processes used in jobs 
+________________________________________
+1.7 Process Barcode (Important Feature)
+The system should allow:
+👉 Barcode generation for each process
+________________________________________
+Usage
+•	Each process has unique barcode 
+•	Operator scans barcode 
+•	Process automatically updated 
+________________________________________
+Example:
+Process	Barcode
+Cutting	CUT-001
+Crimping	CRP-001
+________________________________________
+1.8 Default Process (Recommended by System)
+This is very important — below is the best standard flow for fenestration industry:
+________________________________________
+Default Production Process Flow
+Seq	Process Code	Process Name	Mandatory
+1	CUT	Cutting	Yes
+2	CNC	CNC / Drilling	Optional
+3	CRP	Crimping	Yes
+4	ASM	Assembly	Yes
+5	GLS	Glass Fitting	Optional
+6	QC	Final QC	Recommended
+7	DSP	Dispatch	Yes
+8	INS	Site Installation	Yes (Final Process)
+________________________________________
+🔥 Mandatory Processes (as you said)
+✔ Cutting
+✔ Crimping
+✔ Dispatch
+✔ Installation
+________________________________________
+🔥 Final Process
+👉 Installation should be Final Process
+________________________________________
+1.9 Process Weightage Logic
+Weightage defines contribution to completion.
+________________________________________
+Example:
+Process	Weightage
+Cutting	15%
+Crimping	20%
+Assembly	25%
+Dispatch	20%
+Installation	20%
+________________________________________
+Use Case
+•	Calculate % completion of job 
+•	Dashboard progress 
+________________________________________
+1.10 Sequence Logic
+Processes must follow order.
+Cutting → Crimping → Assembly → Dispatch → Installation
+________________________________________
+Rules
+•	Sequence must be unique 
+•	No duplicate sequence 
+•	Final process must have highest sequence 
+________________________________________
+1.11 Validation Rules
+1.	Process Code must be unique 
+2.	Process Name is mandatory 
+3.	Sequence Number must be unique 
+4.	Only one Final Process allowed 
+5.	Weightage should not exceed 100% total 
+6.	Active process only used in tracking 
+7.	If scanning enabled → barcode required 
+________________________________________
+1.12 Business Rules
+1.	Process flow defines job tracking 
+2.	Process order is controlled by sequence 
+3.	Final process defines job completion 
+4.	Scanning-enabled processes support real-time updates 
+5.	Quantity-based processes track production quantity 
+6.	Default processes can be modified by user 
+________________________________________
+1.13 One-Line Definition
+Production Process Master defines the configurable sequence of operations required to complete a job, enabling structured production tracking and real-time process monitoring.
+2. Job Production Tracking
+________________________________________
+2.1 Purpose
+The Job Production Tracking Module is used to monitor and control job-wise production progress from fabrication to dispatch and site installation.
+It provides:
+•	real-time job progress 
+•	process-wise tracking 
+•	barcode-based execution 
+•	linkage with job, material, and delivery modules 
+________________________________________
+2.2 Core Concept
+Each secured job follows a defined production process flow.
+Example:
+Cutting → CNC → Crimping → Assembly → Dispatch → Installation
+Tracking happens:
+👉 Job Level + Position Level (Primary)
+👉 Cut Level (Optional Advanced)
+________________________________________
+2.3 Top Grid / Actions
+Action	Description
+Edit	Modify job production configuration
+Refresh	Reload data
+Export to Excel	Export job tracking
+History	View job production history
+________________________________________
+2.4 Filters Section
+________________________________________
+Fields
+Field	Description
+Job Number	Direct input
+Secured Job Date (From–To)	Filter by job confirmation
+Delivery Date (From–To)	Filter by delivery
+Status	Job status
+Search	Load data
+________________________________________
+Status Values
+•	All 
+•	Secured Job 
+•	In Production 
+•	Pending Dispatch 
+•	Dispatched 
+•	Installation In Progress 
+•	Completed 
+________________________________________
+2.5 Listing Screen (Main Grid)
+________________________________________
+Grid Fields
+Field	Description
+Job Number	Unique job ID
+Order Confirmation Date	Job confirmation
+Project Name	Project
+Customer Name	Customer
+Profile	Indicator
+Glass	Indicator
+Accessories	Indicator
+Hardware	Indicator
+Delivery Date	Planned
+Production Date	Planned
+Branch	Factory
+Cutting	Process progress
+CNC	Process progress
+Crimping	Process progress
+Assembly	Process progress
+Dispatch	Process progress
+Installation	Process progress
+Glazed?	Auto
+Delivery Status	From delivery module
+Delivered?	From site
+Field Comment	Site notes
+Tracking Comment	Production notes
+Comments	General
+________________________________________
+2.6 Indicator Logic
+________________________________________
+Material Indicators (Profile / Glass / etc.)
+Value	Meaning
+Green	Data available/imported
+Blank	Not available
+________________________________________
+Glazed?
+Condition	Value
+Glass exists in job	Yes
+No glass	No
+________________________________________
+2.7 Delivery Integration
+________________________________________
+Delivery Status
+Status	Meaning
+Pending	No DN
+In Progress	DN created
+On the Way	Dispatched
+Partially Delivered	Partial
+Delivered	Fully done
+________________________________________
+Delivered?
+Value	Meaning
+No	Not received
+Partial	Partial received
+Yes	Fully received
+________________________________________
+🔥 Mobile Integration
+At site:
+•	scan barcode 
+•	click Receive 
+•	update status 
+________________________________________
+2.8 Process Progress Logic
+Each process shows:
+Completed Qty / Total Qty
+Example:
+•	1/1 → Complete 
+•	0/1 → Pending 
+•	1/3 → In progress 
+________________________________________
+Color Logic
+Color	Meaning
+Green	Completed
+Yellow	In Progress
+Red	Pending
+Grey	N/A
+________________________________________
+2.9 Job Detail Screen
+________________________________________
+Tabs
+Tab	Description
+Details	Job info
+Items	Positions
+Profile	Profiles
+Glass	Glass
+Accessories	Accessories
+Hardware	Hardware
+Documents	Files
+Purchase Order	Linked PO
+Barcode Generator	Barcode
+________________________________________
+________________________________________
+Job Details Section
+Field	Description
+Job Number	ID
+Status	Status
+Branch	Factory
+Project Name	Project
+Order Confirmation Date	Date
+Delivery Date	Date
+Production Date	Date
+Comment	General
+Tracking Comment	Production
+________________________________________
+________________________________________
+2.10 Product Type Summary
+Field	Description
+Product Type	System
+Total	Qty
+________________________________________
+________________________________________
+2.11 Process Configuration
+________________________________________
+Grid
+Field	Description
+Select	Checkbox
+Process Name	Name
+Process Code	Code
+Description	Description
+________________________________________
+Logic
+•	Default processes from master 
+•	User can: 
+o	select / deselect 
+o	customize per job 
+________________________________________
+________________________________________
+2.12 Barcode System (FINAL LOGIC)
+________________________________________
+🔥 Core Principle
+System must support flexible barcode usage and must NOT depend on cut-wise barcode
+________________________________________
+2.12.1 Supported Barcode Types
+________________________________________
+✅ 1. Window / Position Barcode (MANDATORY)
+👉 Primary tracking unit
+Used for:
+•	production 
+•	dispatch 
+•	installation 
+________________________________________
+🔹 2. Cut-wise Barcode (OPTIONAL)
+👉 Detailed factory tracking
+________________________________________
+🔹 3. Profile Detail Barcode (OPTIONAL)
+👉 Internal grouping
+________________________________________
+________________________________________
+2.12.2 Final Rule
+If Cut Barcode Exists → Use Detailed Tracking  
+Else → Use Position Barcode
+________________________________________
+2.12.3 Barcode Generation Flow
+Open Job → Barcode Generator → Select Type → Generate → Save → Print
+________________________________________
+2.12.4 Barcode Structure
+________________________________________
+Window Barcode:
+Job No + Position
+Example:
+2600011-001
+________________________________________
+Cut Barcode:
+Job + Position + Material + Seq
+Example:
+2600011-001-BF73-01
+________________________________________
+________________________________________
+2.12.5 Barcode Label Design
+________________________________________
+🔹 Window Barcode (MANDATORY)
+Size: 100mm x 50mm
+Includes:
+•	Job No 
+•	Position 
+•	Product Type 
+•	Dimension 
+•	System 
+•	Barcode 
+•	Image (optional) 
+________________________________________
+________________________________________
+🔹 Cut Barcode (Optional)
+Size: 50mm x 25mm
+Includes:
+•	Material Code 
+•	Cut Length 
+•	Position 
+•	Orientation 
+•	Barcode 
+________________________________________
+________________________________________
+2.12.6 Barcode Usage Logic
+________________________________________
+Case 1: Only Window Barcode
+✔ Allowed
+✔ Full system works
+________________________________________
+Case 2: Cut Barcode Exists
+✔ Detailed tracking
+________________________________________
+Case 3: Both
+✔ Advanced tracking
+________________________________________
+________________________________________
+2.13 Production Tracking Logic
+________________________________________
+Tracking Levels
+Level	Description
+Job	Overall
+Position	Primary
+Cut	Optional
+________________________________________
+________________________________________
+Process Behavior
+________________________________________
+If Window Barcode
+•	process = full position 
+________________________________________
+If Cut Barcode
+•	process = per piece 
+________________________________________
+________________________________________
+2.14 Barcode Scanning Flow
+Scan → Identify Job → Identify Position → Identify Process → Update Status
+________________________________________
+________________________________________
+2.15 Validation Rules
+1.	Job must be secured 
+2.	Process must be active 
+3.	Barcode must be generated before scanning 
+4.	At least one barcode required 
+5.	System must allow no cut barcode scenario 
+6.	Duplicate barcode not allowed 
+________________________________________
+________________________________________
+2.16 Business Rules
+1.	Tracking is job-wise 
+2.	Position barcode is mandatory 
+3.	Cut barcode is optional 
+4.	Delivery linked with DN module 
+5.	Glazed auto from glass 
+6.	Process from master 
+7.	Barcode drives production tracking 
+8.	System must be flexible 
+________________________________________
+________________________________________
+2.17 One-Line Definition
+Job Production Tracking monitors job execution through configurable processes using flexible barcode-based tracking from fabrication to installation.
+
+
+
+3. Production Scanning (FINAL – WITH BATCH LAYER)
+________________________________________
+3.1 Purpose
+The Production Scanning Module is used to update production progress in real time by scanning or entering barcodes linked to job positions or material cuts.
+This module ensures:
+•	real-time production updates 
+•	process-wise tracking (Cutting, CNC, Crimping, etc.) 
+•	direct integration with Job Production Tracking 
+•	integration with Batch-wise Production Tracking 
+•	operator accountability 
+•	minimal manual effort 
+________________________________________
+3.2 Core Concept
+Production scanning works as:
+Select Process → Scan Barcode → Identify Job + Position → Identify Batch → Update Process → Reflect in Job Tracking + Batch Tracking
+________________________________________
+🔥 Most Important Logic
+Every barcode scan must:
+👉 Update Job Production Tracking (Primary)
+👉 Update Batch Production Tracking (Secondary Layer)
+________________________________________
+Example:
+•	Process = Cutting 
+•	Barcode = Window 001 
+👉 After scan:
+•	Job Tracking → Cutting updated (1/1) 
+•	Batch Tracking → Produced Qty updated 
+________________________________________
+3.3 Supported Scanning Modes
+________________________________________
+1. Manual Entry
+•	User types or pastes barcode 
+________________________________________
+2. Barcode Gun / Reader
+•	Scanner directly inputs barcode 
+________________________________________
+3. Mobile Application
+•	Scan via mobile camera 
+________________________________________
+3.4 User Identification
+________________________________________
+Logic
+User must be identified before scanning.
+________________________________________
+Methods
+Method	Description
+Login User	Auto
+User Barcode	Optional scan
+________________________________________
+✅ Final Rule
+Logged-in user = default  
+User barcode = optional override
+________________________________________
+3.5 Production Scanning Screen
+________________________________________
+3.5.1 Header Section
+Field	Description
+Process	Select process (Cutting, CNC, etc.)
+Scan Mode	Manual / Reader / Mobile
+Job Number	Optional filter
+Batch No	Optional (NEW FIELD)
+Scan By	Auto (logged user)
+Department	Production / Dispatch / Site
+Scan Time	Auto
+________________________________________
+🔥 New Field: Batch No (Optional)
+•	User can select batch manually
+OR 
+•	system auto-detects batch 
+________________________________________
+________________________________________
+3.5.2 Process Dropdown
+Values come from Production Process Master
+Example:
+•	Cutting 
+•	CNC 
+•	Crimping 
+•	Ready for Dispatch 
+•	Installation 
+________________________________________
+3.6 Barcode Input Section
+________________________________________
+Workflow
+1.	Select Process 
+2.	(Optional) Select Job 
+3.	(Optional) Select Batch 
+4.	Scan / Enter Barcode 
+5.	Press Enter / Auto Scan 
+________________________________________
+________________________________________
+3.7 Final Production Scanning Workflow
+________________________________________
+Step-by-Step Flow
+Open Screen  
+→ Select Process  
+→ (Optional) Select Job  
+→ (Optional) Select Batch  
+→ Scan Barcode  
+→ System Validates  
+→ Identify Job + Position  
+→ Identify Batch  
+→ Update Process  
+→ Update Job Tracking  
+→ Update Batch Tracking  
+→ Grid Updated
+________________________________________
+3.8 System Validation Logic
+________________________________________
+System must validate:
+1.	Barcode exists 
+2.	Barcode linked with Job 
+3.	Process is valid 
+4.	Process not already completed 
+5.	Job (if selected) matches barcode 
+6.	User identified 
+7.	Batch validity (if batch exists) 
+________________________________________
+________________________________________
+3.9 Scan Data Grid (FINAL STRUCTURE)
+________________________________________
+✅ Final Grid Fields
+Field	Description
+Barcode	Scanned barcode
+Profile Name / Position	Item / window
+Unit Value	Length / size
+Production Scan By	User
+Job No	Job reference
+Batch No	Batch reference (NEW)
+Customer Name	Customer
+Process Name	Process
+Production Scan Time	Timestamp
+Production Scan Status	Success / Duplicate / Error
+Production Scan Qty	Quantity
+Material Category	Profile / Glass / etc.
+Orientation	L / R / T / B (if applicable)
+Scan Mode	Manual / Reader / Mobile
+Remarks	System message
+________________________________________
+3.10 Barcode Interpretation Logic
+________________________________________
+Primary Barcode: Window / Position Barcode
+👉 Mandatory
+•	One scan = one position update 
+•	Works for all scenarios 
+________________________________________
+________________________________________
+Optional: Cut-wise Barcode
+👉 Advanced tracking
+•	One scan = one piece 
+________________________________________
+________________________________________
+🔥 Final Rule
+If Cut Barcode Exists → Detailed Tracking  
+Else → Position-Level Tracking
+________________________________________
+3.11 Process Update Logic
+________________________________________
+If Position Barcode
+•	update full position 
+•	update job + batch 
+________________________________________
+If Cut Barcode
+•	update piece 
+•	update job + batch 
+________________________________________
+________________________________________
+3.12 Quantity Logic
+________________________________________
+If Process = Quantity Based
+•	Completed Qty increases 
+•	Pending Qty recalculated 
+________________________________________
+If Not Quantity Based
+•	Status updated only 
+________________________________________
+________________________________________
+3.13 Process Status Logic
+________________________________________
+Status	Meaning
+Pending	Not started
+In Progress	Partial
+Completed	Done
+Duplicate	Already scanned
+Error	Invalid
+________________________________________
+________________________________________
+3.14 Job Tracking Integration (Primary Layer)
+________________________________________
+🔥 Core Rule
+Every scan must update:
+👉 Job Production Tracking Grid
+________________________________________
+Example
+Process	Before	After
+Cutting	0/2	1/2
+________________________________________
+________________________________________
+3.15 Batch Tracking Integration (NEW LAYER)
+________________________________________
+🔥 Core Rule
+Every scan must also update:
+👉 Batch Production Tracking
+________________________________________
+________________________________________
+3.15.1 Batch Identification Logic
+System identifies batch using:
+Job + Position + Active Batch
+________________________________________
+________________________________________
+3.15.2 Batch Allocation Rules
+________________________________________
+Case 1: Batch Selected by User
+👉 Scan goes to selected batch
+________________________________________
+Case 2: Batch Not Selected
+👉 System auto-selects batch:
+Earliest Active Batch (FIFO)
+________________________________________
+________________________________________
+Case 3: Multiple Batches Exist
+👉 Allocate scan to:
+•	batch with pending qty 
+•	first created batch 
+________________________________________
+________________________________________
+3.15.3 Batch Update Example
+Batch 1 = 10
+After scan:
+•	Produced = 5 
+•	Pending = 5 
+________________________________________
+________________________________________
+3.16 Error Handling
+System must show:
+•	Barcode not found 
+•	Already scanned 
+•	Wrong process 
+•	Job mismatch 
+•	Batch not found 
+•	Qty exceeded 
+________________________________________
+________________________________________
+3.17 Save Logic
+On successful scan:
+•	scan saved 
+•	job tracking updated 
+•	batch tracking updated 
+•	history updated 
+•	timestamp recorded 
+________________________________________
+________________________________________
+3.18 Mobile Application Logic
+________________________________________
+Workflow:
+•	login 
+•	select process 
+•	scan barcode 
+•	confirm 
+________________________________________
+Use Cases:
+•	dispatch 
+•	site receiving 
+•	installation 
+________________________________________
+________________________________________
+3.19 UI Recommendation
+________________________________________
+Layout
+[ Process Dropdown ]
+[ Job Number (Optional) ]
+[ Batch No (Optional) ]
+[ Barcode Input Box ]
+
+[ Message Area ]
+
+[ Scan History Grid ]
+________________________________________
+👉 Fast and minimal clicks
+________________________________________
+________________________________________
+3.20 Validation Rules
+1.	Process mandatory 
+2.	Barcode mandatory 
+3.	User must be identified 
+4.	Barcode must exist 
+5.	No duplicate completion 
+6.	Job filter must match 
+7.	Batch must be valid 
+________________________________________
+________________________________________
+3.21 Business Rules
+1.	Scanning updates job tracking (primary) 
+2.	Scanning updates batch tracking (secondary) 
+3.	Position barcode must always work 
+4.	Cut barcode optional 
+5.	Batch selection optional 
+6.	System auto-assign batch if not selected 
+7.	FIFO logic must apply 
+8.	Real-time update required 
+________________________________________
+________________________________________
+3.22 One-Line Definition (Final Updated)
+Production Scanning is the real-time process of updating job production stages through barcode scanning, while simultaneously updating job-level tracking and batch-level execution with full traceability.
+4. Batch-wise Production Tracking (FINAL – MULTI JOB VERSION)
+________________________________________
+4.1 Purpose
+The Batch-wise Production Tracking Module is used to group production activities into batches, where:
+•	one batch can contain one or multiple jobs 
+•	production, dispatch, and installation can be tracked in stages 
+•	operations can be optimized based on material, system, or schedule 
+________________________________________
+🔥 4.2 Core Concept (Updated)
+👉 A Batch = Production Group
+It can include:
+•	single job
+OR 
+•	multiple jobs 
+________________________________________
+Example:
+Batch 1:
+Job	Qty
+Job A	20
+Job B	15
+Job C	10
+👉 Total Batch = 45
+________________________________________
+4.3 Why Multi-Job Batch is Required
+In fenestration:
+•	same system/profile used across jobs 
+•	production runs combined 
+•	powder coating / fabrication grouped 
+•	dispatch planned together 
+________________________________________
+4.4 Top Grid / Actions
+Action	Description
+Add New	Create batch
+Edit	Modify batch
+View	View batch
+Refresh	Reload
+Export to Excel	Export
+Print	Print
+________________________________________
+4.5 Batch Listing Grid
+________________________________________
+4.5.1 Final Grid Structure
+Field	Description
+Batch No	Unique ID
+Batch Name	Name
+Batch Date	Date
+Total Jobs	No. of jobs
+Total Batch Qty	Total qty
+Produced Qty	Completed
+Pending Qty	Remaining
+Dispatched Qty	Sent
+Installed Qty	Installed
+Status	Batch status
+Created By	User
+Remarks	Notes
+________________________________________
+________________________________________
+4.6 Add New Batch Screen (Updated)
+________________________________________
+4.6.1 Header Section
+Field	Description
+Batch No	Auto
+Batch Name	Optional
+Batch Date	Date
+Remarks	Notes
+________________________________________
+________________________________________
+4.6.2 Job Selection Section
+________________________________________
+Grid: Job Selection
+Field	Description
+Select	Checkbox
+Job Number	Job
+Project Name	Project
+Customer Name	Customer
+Delivery Date	Delivery
+Total Job Qty	Total
+Available Qty	Available
+________________________________________
+👉 User can select multiple jobs
+________________________________________
+________________________________________
+4.6.3 Position Selection Grid (Core Grid)
+________________________________________
+Final Grid Structure
+Field	Description
+Select	Checkbox
+Job Number	Job
+Position No	Window
+Product Type	System
+Total Qty	Required
+Already Assigned Qty	Allocated
+Available Qty	Remaining
+Batch Qty	Qty for batch
+________________________________________
+________________________________________
+4.6.4 Batch Creation Logic
+________________________________________
+Rule:
+Batch Qty ≤ Available Qty
+________________________________________
+Additional Rule:
+Total Batch Qty = Sum of all selected positions across jobs
+________________________________________
+________________________________________
+4.7 Batch Status Flow
+________________________________________
+Status Values
+Status	Meaning
+Created	Batch created
+In Production	Started
+Production Completed	Done
+Dispatched	Sent
+Partially Installed	Partial
+Installed	Done
+________________________________________
+________________________________________
+4.8 Batch Production Tracking (Updated)
+________________________________________
+🔥 Integration with Production Scanning
+________________________________________
+When scanning barcode:
+System identifies:
+Barcode → Job → Position → Batch → Process
+________________________________________
+________________________________________
+4.8.1 Production Update Logic
+________________________________________
+Example:
+Batch contains:
+•	Job A → Position 001 → Qty 10 
+•	Job B → Position 002 → Qty 5 
+________________________________________
+After scan:
+•	Batch Produced Qty increases 
+•	Individual Job tracking also updates 
+________________________________________
+________________________________________
+4.9 Multi-Job Batch Allocation Logic
+________________________________________
+🔥 Key Logic
+When barcode is scanned:
+System must:
+1.	Identify Job from barcode 
+2.	Identify Position 
+3.	Find batch containing that position 
+________________________________________
+________________________________________
+4.9.1 Batch Matching Rule
+Find Active Batch where:
+Job + Position exists AND Qty pending > 0
+________________________________________
+________________________________________
+4.9.2 If Multiple Batches Exist
+Apply:
+👉 FIFO (First Created Batch First)
+________________________________________
+________________________________________
+4.10 Dispatch Tracking (Multi-Job)
+________________________________________
+Logic:
+Delivery note linked with:
+•	Batch 
+•	Job 
+•	Position 
+________________________________________
+Example:
+Batch 1:
+Job	Dispatched
+Job A	10
+Job B	5
+________________________________________
+________________________________________
+4.11 Installation Tracking (Multi-Job)
+________________________________________
+Logic:
+At site:
+•	barcode scanned 
+•	job identified 
+•	batch updated 
+________________________________________
+________________________________________
+4.12 Batch vs Job Integration
+________________________________________
+🔥 Important Rule
+Batch updates must reflect in Job Tracking.
+________________________________________
+Example:
+Level	Update
+Batch	Produced = 20
+Job A	Updated
+Job B	Updated
+________________________________________
+________________________________________
+4.13 Barcode Integration
+________________________________________
+🔹 Position Barcode
+•	identifies Job + Position 
+•	updates correct batch 
+________________________________________
+🔹 Cut Barcode (Optional)
+•	detailed tracking 
+•	still linked to batch 
+________________________________________
+________________________________________
+🔥 Final Rule
+Barcode must always map to:
+Job → Position → Batch
+________________________________________
+________________________________________
+4.14 Scan Allocation Logic (Updated)
+________________________________________
+Case 1: Single Batch
+→ All scans go to that batch
+________________________________________
+Case 2: Multiple Batches
+→ Apply FIFO
+________________________________________
+Case 3: Multiple Jobs in Batch
+→ System identifies correct job from barcode
+________________________________________
+________________________________________
+4.15 Batch Validation Rules
+________________________________________
+1.	Batch can include multiple jobs 
+2.	Batch qty cannot exceed available qty 
+3.	Position cannot exceed job qty 
+4.	Dispatch ≤ Produced 
+5.	Installation ≤ Dispatched 
+6.	Batch must be active 
+________________________________________
+________________________________________
+4.16 Batch History
+________________________________________
+System must store:
+•	job-wise batch allocation 
+•	production logs 
+•	dispatch logs 
+•	installation logs 
+________________________________________
+________________________________________
+4.17 Batch Dashboard (Recommended)
+________________________________________
+KPIs
+•	Total Batches 
+•	Total Jobs in Batches 
+•	Production Progress 
+•	Dispatch Status 
+•	Installation Status 
+________________________________________
+________________________________________
+4.18 Export / Print
+________________________________________
+Export Fields
+•	Batch No 
+•	Job 
+•	Position 
+•	Qty 
+•	Produced 
+•	Dispatched 
+•	Installed 
+________________________________________
+________________________________________
+4.19 UI Recommendation
+________________________________________
+Layout
+[ Batch List ]
+
+[ Add Batch ]
+
+[ Job Selection ]
+
+[ Position Grid ]
+
+[ Status Tracking ]
+________________________________________
+________________________________________
+4.20 Business Rules (Final)
+________________________________________
+1.	One batch can include multiple jobs 
+2.	Batch must be linked to job + position 
+3.	Production scanning must update batch 
+4.	Dispatch and installation must track batch 
+5.	FIFO must apply when multiple batches exist 
+6.	System must support partial execution 
+7.	Batch must not exceed available qty 
+8.	Barcode must map correctly 
+________________________________________
+________________________________________
+4.21 One-Line Definition
+Batch-wise Production Tracking groups one or multiple jobs into production batches to enable staged fabrication, dispatch, and installation with real-time tracking and barcode integration.
+________________________________________
+🔥 Final Insight
+With this design:
+✔ You support small + large factories
+✔ You support grouped production
+✔ You support real-life execution
+✔ You avoid system limitation
+Material Consumption (Against Job) – Final Document
+This version includes:
+•	top screen actions 
+•	filter section 
+•	summary grid 
+•	add consumption popup 
+•	consumption history 
+•	logic and validations 
+________________________________________
+Material Consumption (Against Job)
+1. Purpose
+The Material Consumption Module is used to record the actual quantity of material consumed by the Production Team after the material has already been issued against a specific Job.
+This module helps the organization track:
+•	total material issued to production 
+•	actual material consumed in stages 
+•	material returned back to warehouse 
+•	remaining balance still lying with production 
+This module is important because issued quantity and consumed quantity are not always the same.
+________________________________________
+2. Core Concept
+The process flow is:
+Material Issue With Job → Material goes to Production Team → Production consumes material in parts → Unused balance may remain with production or be returned to warehouse
+So this module should only work on already issued material.
+It should not create a fresh stock issue.
+________________________________________
+3. Top Grid / Actions
+When the user opens Material Consumption, the top action bar should show:
+Action	Description
+Add Consumption	Add a new consumption entry
+View	View saved consumption details
+Refresh	Reload latest data
+Export to Excel	Export material consumption data
+Print	Print material consumption report
+________________________________________
+4. Filter / Search Section
+At the top of the screen, a filter section should be available.
+Filter Fields
+Field	Description
+Job Number	Select from dropdown
+Material Type	Profile / Hardware / Accessories / Glass / Other
+Department	Production / Factory
+Search	Load issued material records
+________________________________________
+5. Filter Logic
+Job Number
+Once the user selects the Job Number, the system should load all materials that were issued against that job.
+Material Type
+If Material Type is selected, the grid should show only those material lines.
+Department
+Can be used to filter consumption based on production area/team if required.
+________________________________________
+6. Main Screen Structure
+The Material Consumption screen should be divided into:
+1.	Header / Filter Section 
+2.	Material Consumption Summary Grid 
+3.	Consumption Detail History Section 
+4.	Consumption Entry Popup / Form 
+________________________________________
+7. Material Consumption Summary Grid
+This is the main grid displayed after selecting a job.
+The grid should load material details from:
+👉 Material Issue With Job
+and Returned Quantity should come from:
+👉 Material Issued Return With Job
+________________________________________
+7.1 Final Summary Grid Structure
+Field	Description	Editable
+Material Type	Auto-populate from Material Issue With Job	No
+Material Code	Auto-populate from Material Issue With Job	No
+Material Description	Auto-populate from Material Issue With Job	No
+Material Name	Auto-populate from Material Issue With Job	No
+UOM	Auto-populate from Material Issue With Job	No
+Unit Value	Auto-populate from Material Issue With Job	No
+Colour	Auto-populate from Material Issue With Job	No
+Issued Quantity	Auto-populate from Material Issue With Job	No
+Consumed Quantity	Sum of all saved consumption entries	No
+Returned Quantity	Auto-populate from Material Issued Returned With Job	No
+Remaining Quantity	Auto-calculated	No
+Material User	User to whom material was originally issued	No
+Department	Department linked to issue/consumption	No
+Remarks	Latest remark / summary note	No
+Action	Add Consumption / View History	Yes
+________________________________________
+7.2 Core Logic in Summary Grid
+Issued Quantity
+Comes from Material Issue With Job
+Consumed Quantity
+Comes from sum of all consumption entries saved in this module
+Returned Quantity
+Comes automatically from Material Issued Return With Job
+Remaining Quantity
+System should calculate automatically.
+Formula
+Remaining Quantity = Issued Quantity – Consumed Quantity – Returned Quantity
+________________________________________
+7.3 Important Meaning
+Field	Meaning
+Issued Quantity	Total quantity handed to production
+Consumed Quantity	Actual quantity used in fabrication
+Returned Quantity	Unused quantity physically returned to warehouse
+Remaining Quantity	Balance still lying with production team
+________________________________________
+8. Add Consumption Entry
+The system should allow adding consumption in multiple stages.
+Why?
+Because material may be consumed across different dates/processes.
+Example:
+•	Day 1 = 5 used 
+•	Day 3 = 3 used 
+•	Day 5 = 2 used 
+________________________________________
+8.1 Add Consumption Button
+Each row in the summary grid should have:
+👉 Add Consumption
+When user clicks it, a popup or side panel should open.
+________________________________________
+8.2 Consumption Entry Popup / Form
+Fields
+Field	Description	Source / Behavior
+Job Number	Job against which material was issued	Auto
+Material Code	Material code	Auto
+Material Name	Material name	Auto
+Issued Quantity	Total issued	Auto
+Already Consumed Quantity	Total consumption already recorded	Auto
+Returned Quantity	Quantity returned to warehouse	Auto
+Available for Consumption	Balance available for new consumption	Auto
+Consumption Date	Date of use	Manual / current date
+Consumed Quantity	New quantity being consumed now	Manual
+Consumed By	Production user / operator	Manual / auto
+Process Name	Cutting / Assembly / etc. (optional but recommended)	Dropdown
+Remarks	Notes	Manual
+________________________________________
+8.3 Available for Consumption Logic
+This should be shown in popup for clarity.
+Formula
+Available for Consumption = Issued Quantity – Already Consumed Quantity – Returned Quantity
+Validation
+New Consumed Quantity ≤ Available for Consumption
+________________________________________
+9. Consumption History Grid
+Below the summary grid, or as a popup detail screen, the module should show all previous consumption entries.
+This is very important for audit and tracking.
+________________________________________
+9.1 Final Consumption History Grid
+Field	Description
+Consumption Date	Date of usage
+Job Number	Job
+Material Code	Material
+Material Name	Material
+Consumed Quantity	Quantity used on that entry
+Consumed By	User / operator
+Process Name	Production process
+Department	Department
+Remarks	Notes
+Created By	Logged in user
+Created DateTime	Timestamp
+________________________________________
+9.2 Purpose of History Grid
+This helps users see:
+•	how much was consumed each time 
+•	on which date 
+•	by whom 
+•	in which process 
+This is useful for:
+•	production accountability 
+•	internal audit 
+•	wastage analysis 
+•	cost tracking later 
+________________________________________
+10. Detailed Logic
+10.1 Consumption in Multiple Stages
+Consumption should not be one-time only.
+The same material line can have multiple consumption entries.
+Example
+Issued = 10
+Date	Consumed
+01-Apr	5
+03-Apr	3
+05-Apr	2
+Final Summary
+•	Issued = 10 
+•	Consumed = 10 
+•	Returned = 0 
+•	Remaining = 0 
+________________________________________
+10.2 Returned Quantity Integration
+If production returns material to warehouse, that quantity should automatically appear in Returned Quantity.
+The user should not type it manually in this module.
+This must stay linked with:
+👉 Material Issued Returned With Job
+________________________________________
+10.3 Remaining Quantity Behavior
+Remaining quantity tells the user how much quantity is still with production and not yet consumed or returned.
+Example
+•	Issued = 10 
+•	Consumed = 5 
+•	Returned = 2 
+Then:
+Remaining = 10 – 5 – 2 = 3
+That means 3 is still lying with production.
+________________________________________
+11. Save Logic
+When user enters a new consumption quantity and clicks Save:
+1.	system validates the quantity 
+2.	saves the consumption entry 
+3.	updates total consumed quantity in summary 
+4.	recalculates remaining quantity 
+5.	stores history 
+________________________________________
+11.1 Confirmation Popup (Recommended)
+System may ask:
+“Are you sure you want to save material consumption?”
+If user confirms:
+•	entry is saved 
+•	summary grid refreshes 
+•	consumption history updates 
+________________________________________
+12. Validation Rules
+1.	Job Number is mandatory 
+2.	Material line must be from issued material 
+3.	Consumed Quantity must be numeric 
+4.	Consumed Quantity must be greater than zero 
+5.	Consumed Quantity cannot exceed available consumption balance 
+6.	Returned Quantity is system-linked, not manually editable 
+7.	Remaining Quantity cannot be negative 
+8.	Only active issued records should appear 
+________________________________________
+13. Quantity Control Logic
+Formula 1 – Total Consumed
+Total Consumed Quantity = Sum of all saved consumption entries
+Formula 2 – Available Consumption Balance
+Available Consumption Balance = Issued Quantity – Returned Quantity – Total Consumed Quantity
+Formula 3 – Remaining Quantity
+Remaining Quantity = Issued Quantity – Consumed Quantity – Returned Quantity
+________________________________________
+14. Transaction / Audit Impact
+This module should create Material Consumption History, not another warehouse stock OUT.
+Important distinction
+•	Material Issue = stock already reduced from warehouse 
+•	Material Consumption = internal production usage tracking 
+•	Material Return = physical quantity returned to warehouse 
+So this module should update:
+•	job consumption records 
+•	production consumption history 
+•	reporting / costing references 
+It should not reduce stock again.
+________________________________________
+15. Suggested Additional Fields (Recommended)
+For enterprise usage, you may also keep:
+Field	Description
+Material User	Person to whom issue was originally done
+Batch No	If production is batch-wise
+Workstation / Area	Optional future use
+Production Process	Process where material consumed
+These can be optional now and expanded later.
+________________________________________
+16. Export to Excel
+The module should support Export to Excel.
+The export should include:
+•	summary grid 
+•	consumed quantity 
+•	returned quantity 
+•	remaining quantity 
+•	consumption history (optional separate sheet) 
+Useful for:
+•	production review 
+•	audit 
+•	cost analysis 
+•	variance analysis 
+________________________________________
+17. Print Output
+The print version may include:
+•	Job Number 
+•	Project Name 
+•	Material summary 
+•	issued / consumed / returned / remaining quantities 
+•	detailed consumption history 
+This can be useful for internal tracking.
+________________________________________
+18. Business Rules
+1.	Material Consumption works only on already issued material 
+2.	User cannot manually select warehouse stock here 
+3.	Consumption can happen multiple times for same material 
+4.	Returned Quantity must auto-link from Return Module 
+5.	Remaining Quantity must always be system-calculated 
+6.	Consumption must not exceed available balance 
+7.	This module records actual usage, not stock issue 
+8.	Consumption history must be maintained 
+________________________________________
+19. Recommended One-Line Definition
+Material Consumption is the process of recording the actual quantity used by production from already issued material, while automatically tracking returned quantity and remaining balance for each job.
+________________________________________
+20. Final Suggested Workflow
+Open Material Consumption → Select Job Number → Load issued material summary → Click Add Consumption on material row → Enter consumption details → Save → Summary updates consumed and remaining quantities → Returned quantity auto-links from return module
+________________________________________
+21. Best UI Recommendation
+The best design is:
+Top
+•	Filter section 
+Middle
+•	Material Consumption Summary Grid 
+Bottom / Popup
+•	Consumption History 
+This gives both:
+•	quick overview 
+•	detailed audit trail
+
